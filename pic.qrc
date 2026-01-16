@@ -1,0 +1,5 @@
+<RCC>
+  <qresource prefix="newPrefix">
+    <file>aaeon_icon.png</file>
+  </qresource>
+</RCC>
