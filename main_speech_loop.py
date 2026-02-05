@@ -1,9 +1,9 @@
+import cv2
 import sys
 import os
 import tempfile
 import asyncio
-import uuid 
-import cv2 
+import uuid  
 from pathlib import Path
 
 from PyQt5 import QtWidgets, QtCore, QtGui, QtMultimedia
@@ -18,8 +18,8 @@ import edge_tts
 from AI_agent_frame import Ui_MainWindow
 
 # --- 設定區 ---
-API_KEY = "AIzaSyAcfVQMO0agc2StxF1lAY8MWsFwnwIHyFY" 
-MODEL_NAME = "gemini-1.5-flash"
+API_KEY = "AIzaSyBdfjLFS2Pd8eiDphgZm2DJZa_QwRjyfoU" 
+MODEL_NAME = "gemini-flash-latest"
 TTS_VOICE = "zh-TW-HsiaoChenNeural"
 
 # --- 影片播放執行緒 (邏輯不變，它會傻傻地照著列表播) ---
