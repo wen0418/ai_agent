@@ -39,7 +39,7 @@ import edge_tts
 from AI_agent_frame import Ui_MainWindow
 
 # --- 設定區 ---
-API_KEY = "AIzaSyBdfjLFS2Pd8eiDphgZm2DJZa_QwRjyfoU" 
+API_KEY = "AIzaSyBPWC3wGHW5NFFp1gFRvUK170v3VnTHCF8" 
 MODEL_NAME = "gemini-flash-latest"
 TTS_VOICE = "zh-TW-HsiaoChenNeural"
 
@@ -112,7 +112,7 @@ class LLMWorker(QThread):
     def run(self):
         try:
             gemini_history = []
-            system_instruction = "你是一個有用的助手。"
+            system_instruction = "你現在是研揚科技AAEON的專業助理請以繁體中文回答問題"
             last_user_message = ""
             for msg in self.history:
                 if msg["role"] == "system": system_instruction = msg["content"]
@@ -128,7 +128,7 @@ class LLMWorker(QThread):
         except Exception as e:
             error_msg = str(e)
             print(f"Gemini Error: {error_msg}")
-            if "429" in error_msg: self.response_received.emit("錯誤：請求太頻繁。")
+            if "429" in error_msg: self.response_received.emit("錯誤：請求太頻繁。但我這邊作一個長度與邊點符號的測試。")
             else: self.response_received.emit(f"連線錯誤: {error_msg}")
 
 class TTSWorker(QThread):
@@ -172,9 +172,12 @@ class MyMainApp(QtWidgets.QMainWindow, Ui_MainWindow):
         
         self.current_audio_path = None
         self.pending_audio_path = None
-        self.conversation_history = [{"role": "system", "content": "你是一個專業的 AAEON 智慧助理，說話簡潔有力，並使用繁體中文回答。"}]
+        self.conversation_history = [{"role": "system", "content": "你現在是研揚科技AAEON的專業助理請以繁體中文回答問題回答內容請盡量控制在30字以內且禁止輸出任何標點符號若語句需停頓請務必使用空格取代以利語音朗讀"}]
         
-        QtCore.QTimer.singleShot(500, lambda: self.add_chat_bubble("你好！我是 AAEON 智慧助理 (MuseTalk)，請下達指令。", is_user=False))
+        # [新增] 暫存 AI 回應文字
+        self.pending_ai_text = None
+
+        QtCore.QTimer.singleShot(500, lambda: self.add_chat_bubble("你好！我是 AAEON 智慧助理，有什麼需要協助的嗎？", is_user=False))
         
         shadow = QGraphicsDropShadowEffect(self.frame_3)
         shadow.setBlurRadius(10); shadow.setColor(QColor(0, 0, 0, 8))
@@ -190,7 +193,7 @@ class MyMainApp(QtWidgets.QMainWindow, Ui_MainWindow):
         layout.addWidget(self.avatar_label)
 
         # 初始化 MuseTalk (確保路徑正確)
-        avatar_talk_path = os.path.join(ai_agent_dir, "vedio/avatar_talk.mp4")
+        avatar_talk_path = os.path.join(ai_agent_dir, "vedio/avatar_small_talk.mp4")
         self.musetalk_worker = MuseTalkWorker(
             avatar_video_path=avatar_talk_path,
             model_config_path="./models/musetalkV15/musetalk.json",
@@ -252,31 +255,45 @@ class MyMainApp(QtWidgets.QMainWindow, Ui_MainWindow):
         self.add_chat_bubble(text, is_user=True)
         self.input_box.clear()
         self.conversation_history.append({"role": "user", "content": text})
+        
+        # 使用者送出後，進入等待狀態
         self.input_box.setPlaceholderText("思考中...")
         self.input_box.setEnabled(False)
+        
         self.llm_worker = LLMWorker(self.conversation_history)
         self.llm_worker.response_received.connect(self.handle_ai_response)
         self.llm_worker.start()
 
     def handle_ai_response(self, response_text):
+        # 1. 存入歷史
         self.conversation_history.append({"role": "assistant", "content": response_text})
-        self.add_chat_bubble(response_text, is_user=False)
+        
+        # 2. [修改] 暫存文字，不馬上顯示氣泡，也不解鎖輸入框
+        self.pending_ai_text = response_text
+        self.input_box.setPlaceholderText("思考中...") # 更新狀態提示
+        
+        # 3. 開始 TTS -> MuseTalk
+        self.tts_worker = TTSWorker(response_text)
+        self.tts_worker.audio_ready.connect(lambda p: self.musetalk_worker.run_inference(p))
+        self.tts_worker.start()
+
+    def on_musetalk_ready(self, frames):
+        # 1. 播放動作
+        self.video_thread.start_talking(frames)
+        
+        # 2. 播放聲音 (透過 musetalk_worker 保存的路徑)
+        if self.musetalk_worker.audio_path:
+            self.start_player_immediately(self.musetalk_worker.audio_path)
+            
+        # 3. [新增] 影片準備好後，才顯示文字氣泡
+        if self.pending_ai_text:
+            self.add_chat_bubble(self.pending_ai_text, is_user=False)
+            self.pending_ai_text = None
+        
+        # 4. [新增] 恢復輸入框
         self.input_box.setEnabled(True)
         self.input_box.setPlaceholderText("請輸入訊息...")
         self.input_box.setFocus()
-        self.tts_worker = TTSWorker(response_text)
-        self.tts_worker.audio_ready.connect(lambda p: self.musetalk_worker.run_inference(p))
-        self.input_box.setPlaceholderText("正在生成影片...")
-        self.tts_worker.start()
-        # [修改] 這裡把 TTS 完成的訊號直接接到 musetalk 的 input，並在 musetalk 回傳時播放聲音
-
-    def on_musetalk_ready(self, frames):
-        self.video_thread.start_talking(frames)
-        # 注意: 聲音路徑要在 TTS 完成時存下來，或透過訊號傳遞。
-        # 為了簡化，這裡建議讓 musetalk_worker 也把 audio_path 傳回來，或是用成員變數存
-        if self.musetalk_worker.audio_path:
-            self.start_player_immediately(self.musetalk_worker.audio_path)
-        self.input_box.setPlaceholderText("請輸入訊息...")
 
     def add_chat_bubble(self, text, is_user):
         bubble = QtWidgets.QWidget()

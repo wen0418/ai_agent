@@ -6,8 +6,7 @@ import numpy as np
 import copy
 import traceback
 import shutil 
-import gc  # [新增] 用於強制回收記憶體
-from tqdm import tqdm
+import gc
 from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtGui import QImage
 
@@ -47,24 +46,22 @@ class MuseTalkWorker(QThread):
         self.whisper_path = whisper_path
         
         self.is_initialized = False
-        self.is_initializing = False # [新增] 防止重複初始化的鎖
+        self.is_initializing = False
         self.audio_path = None
         self.input_latent_list = [] 
-        self.batch_size = 4 
+        self.batch_size = 16
 
     def initialize_models(self):
-        # [關鍵修正] 如果正在初始化，直接返回，不要再跑一次
         if self.is_initialized or self.is_initializing:
             print("Model is already initialized or initializing. Skipping duplicate call.")
             return
 
-        self.is_initializing = True # 上鎖
+        self.is_initializing = True
 
         try:
             self.status_update.emit("正在載入 MuseTalk 模型 (請耐心等待)...")
             print(f"Loading MuseTalk models...")
             
-            # 1. 載入模型 (這一步最吃顯存，加上 no_grad 省空間)
             with torch.no_grad():
                 self.vae, self.unet, self.pe = load_all_model(
                     unet_model_path=self.unet_model_path,
@@ -74,16 +71,13 @@ class MuseTalkWorker(QThread):
                 )
             self.timesteps = torch.tensor([0], device=self.device)
             
-            # 2. 載入 Whisper
             self.audio_processor = AudioProcessor(feature_extractor_path=self.whisper_path)
             from transformers import WhisperModel
             self.whisper = WhisperModel.from_pretrained(self.whisper_path).to(self.device).eval()
             self.whisper.requires_grad_(False)
             
-            # 3. Face Parsing
             self.fp = FaceParsing(left_cheek_width=90, right_cheek_width=90)
 
-            # 4. 預處理 Avatar
             self.status_update.emit("正在預處理 Avatar (這一步會比較久)...")
             self._preprocess_avatar()
             
@@ -96,8 +90,8 @@ class MuseTalkWorker(QThread):
             traceback.print_exc()
             self.status_update.emit(f"模型載入失敗: {e}")
         finally:
-            self.is_initializing = False # 解鎖
-            torch.cuda.empty_cache() # [優化] 清理顯存
+            self.is_initializing = False
+            torch.cuda.empty_cache()
             gc.collect()
 
     def _preprocess_avatar(self):
@@ -128,18 +122,15 @@ class MuseTalkWorker(QThread):
         cap.release()
         print(f"共提取 {len(self.avatar_frames)} 幀，開始計算 Landmark...")
 
-        # 計算座標
         self.coord_list, _ = get_landmark_and_bbox(img_paths, 0)
 
-        # 清理暫存
         try: shutil.rmtree(temp_dir)
         except: pass
 
-        # VAE Encode (分批處理避免 OOM)
         print("開始 VAE Encode (將圖片轉為 Latents)...")
         self.input_latent_list = []
         
-        with torch.no_grad(): # [優化] 必加
+        with torch.no_grad():
             for i, (bbox, frame) in enumerate(zip(self.coord_list, self.avatar_frames)):
                 if bbox == coord_placeholder:
                     self.input_latent_list.append(None)
@@ -154,12 +145,10 @@ class MuseTalkWorker(QThread):
                 latents = self.vae.get_latents_for_unet(crop_frame)
                 self.input_latent_list.append(latents)
                 
-                # [優化] 每處理 20 張清理一次垃圾，防止記憶體堆積
                 if i % 20 == 0:
                     gc.collect()
 
     def run_inference(self, audio_path):
-        # 如果還在初始化，就不能跑推論
         if self.is_initializing:
             print("Model is still initializing, please wait...")
             self.status_update.emit("模型初始化中，請稍候...")
@@ -167,20 +156,17 @@ class MuseTalkWorker(QThread):
 
         if not self.is_initialized:
             print("Model not initialized, initializing now...")
-            self.audio_path = audio_path # 記住要做的事
-            self.start() # 這會呼叫 run -> initialize_models
+            self.audio_path = audio_path
+            self.start()
         else:
             self.audio_path = audio_path
-            self.start() # 這會呼叫 run -> inference logic
+            self.start()
 
     def run(self):
-        # 這是 QThread 的進入點
         if not self.is_initialized:
             self.initialize_models()
-            # 初始化完後，檢查有沒有要跑的 audio (如果是純初始化就不跑)
             if not self.audio_path: return
 
-        # 安全檢查
         if not self.input_latent_list:
             return
 
@@ -203,16 +189,29 @@ class MuseTalkWorker(QThread):
                 
                 audio_frame_num = len(whisper_chunks)
                 
-                # 2. 準備 Batch
+                # 2. 準備 Batch [關鍵修改：精準對齊，不再循環]
                 run_latent_list = []
                 run_coord_list = []
                 run_ori_frame_list = []
                 total_avatar_frames = len(self.input_latent_list)
                 
                 for i in range(audio_frame_num):
-                    idx = i % total_avatar_frames
+                    # 如果還在 Avatar 影片長度內，就照順序用
+                    if i < total_avatar_frames:
+                        idx = i
+                    else:
+                        # 如果超過長度，固定使用第 0 幀 (Idle Pic)
+                        # 這樣頭部會固定住，但嘴巴會繼續跟著聲音動
+                        idx = 0
+                    
+                    # 容錯：萬一選到的幀沒有臉 (None)，則嘗試找第 0 幀或任何有效幀
                     if self.input_latent_list[idx] is None:
-                        idx = (idx + 1) % total_avatar_frames
+                        idx = 0 
+                        if self.input_latent_list[idx] is None:
+                             for k in range(total_avatar_frames):
+                                 if self.input_latent_list[k] is not None:
+                                     idx = k
+                                     break
                     
                     run_latent_list.append(self.input_latent_list[idx])
                     run_coord_list.append(self.coord_list[idx])
@@ -237,7 +236,7 @@ class MuseTalkWorker(QThread):
                     for res_frame in recon:
                         res_frame_list.append(res_frame)
 
-                # 4. 合成 (這步只吃 CPU 記憶體)
+                # 4. 合成
                 final_qt_images = []
                 for i, res_frame in enumerate(res_frame_list):
                     try:
@@ -255,17 +254,8 @@ class MuseTalkWorker(QThread):
                         final_qt_images.append(qt_img)
                     except: continue
 
-                # 5. 補尾幀
-                current_end_idx = audio_frame_num % total_avatar_frames
-                if current_end_idx != 0:
-                    frames_needed = total_avatar_frames - current_end_idx
-                    for i in range(frames_needed):
-                        idx = (current_end_idx + i) % total_avatar_frames
-                        frame = self.avatar_frames[idx]
-                        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        h, w, ch = rgb_frame.shape
-                        qt_img = QImage(rgb_frame.data, w, h, ch * w, QImage.Format_RGB888).copy()
-                        final_qt_images.append(qt_img)
+                # [已刪除] 原本的 Step 5. 補尾幀代碼已刪除
+                # 現在輸出的影片長度會嚴格等於 Audio 長度，最後一幀剛好是 Idle Frame
 
             self.frames_ready.emit(final_qt_images)
             self.status_update.emit("生成完畢")
@@ -275,4 +265,4 @@ class MuseTalkWorker(QThread):
             traceback.print_exc()
             self.status_update.emit("生成發生錯誤")
         finally:
-            torch.cuda.empty_cache() # 跑完一次清一次
+            torch.cuda.empty_cache()
